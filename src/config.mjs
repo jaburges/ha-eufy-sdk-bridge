@@ -119,6 +119,12 @@ export function loadConfig(env = process.env) {
     // How long after the push /clip waits before downloading a HomeBase 2 recording, so the station has
     // finished writing it. Set it at least to the camera's clip length. Default 30s.
     clipSettleMs: env.CLIP_SETTLE_MS != null ? Number(env.CLIP_SETTLE_MS) : 30_000,
+    // Talkback (POST /api/talkback/<sn>, WS device.talkback_play) limits. A clip is cut at the cap —
+    // a request may ask for less, never more — and a fetched or uploaded file larger than the byte cap
+    // is refused, as is a URL that hasn't answered within the fetch timeout. Positive whole numbers.
+    talkbackMaxSeconds: positiveInt(env.TALKBACK_MAX_SECONDS) ?? 30,
+    talkbackMaxBytes: positiveInt(env.TALKBACK_MAX_BYTES) ?? 10 * 1024 * 1024,
+    talkbackFetchTimeoutMs: positiveInt(env.TALKBACK_FETCH_TIMEOUT_MS) ?? 15_000,
     // Event pre-warm: the SDK can speculatively open a camera's P2P session on a high-intent event
     // (doorbell/person/pet/package) so a following live view starts instantly. OFF by default here — it
     // holds a battery camera's radio open for ~28s per event. Set BRIDGE_PREWARM=1 to enable the SDK's

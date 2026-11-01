@@ -1,5 +1,5 @@
 // HTTP surface: live video (go2rtc pulls /stream/<sn>), a snapshot still, the persisted last-event
-// thumbnail, the latest detection's stored clip, and /healthz. Video is deliberately OFF the WS — connecting to /stream is what opens the
+// thumbnail, the latest detection's stored clip, talkback playback, and /healthz. Video is deliberately OFF the WS — connecting to /stream is what opens the
 // camera, disconnecting is what stops it, so there's no "is it streaming" flag to drift. Returns the
 // request handler; server.mjs wraps it in http.createServer.
 import fs from "node:fs";
@@ -9,6 +9,7 @@ import { createLiveStillTap } from "./live-still.mjs";
 import { onBatteryPower } from "./power.mjs";
 import { storedThumbnailSeenAt } from "./stored-thumbnail.mjs";
 import { redactSecrets } from "./redact.mjs";
+import { parseTalkbackRequest } from "./talkback.mjs";
 
 function json(res, code, body) {
   const s = redactSecrets(JSON.stringify(body));
@@ -115,6 +116,22 @@ export function createHttpHandler(ctx) {
       });
     }
     if (!flags.ready) return json(res, 503, { error: "not authenticated", auth: ctx.authStatus() });
+
+    // Play a clip through a camera's speaker (see talkback.mjs). POST starts one, DELETE stops it.
+    const talk = /^\/api\/talkback\/([^/]+)$/.exec(url.pathname);
+    if (talk) {
+      const target = decodeURIComponent(talk[1]);
+      if (req.method === "DELETE") return json(res, 200, { ok: true, stopped: await ctx.talkbackStop(target) });
+      if (req.method !== "POST") return json(res, 405, { error: "use POST to play, DELETE to stop" });
+      try {
+        const fields = await parseTalkbackRequest(req, url, { maxBytes: cfg.talkbackMaxBytes });
+        const result = await ctx.talkbackPlay(target, fields);
+        return json(res, result.started ? 202 : 200, { ok: true, ...result });
+      } catch (e) {
+        ctx.eventLog?.(`/api/talkback ${target} → ${e?.status ?? 500} ${e?.message ?? e}`);
+        return json(res, e?.status ?? 500, { error: String(e?.message ?? e) });
+      }
+    }
 
     // A current still: a fresh live burst, falling back to the retained push thumbnail, and finally to
     // the copy /event-image persisted on disk. That last step matters on accounts whose pushes carry no

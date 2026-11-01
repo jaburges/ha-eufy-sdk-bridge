@@ -16,6 +16,8 @@ const AUTHED_COMMANDS = new Set([
   "device.set",
   "device.action",
   "device.reboot",
+  "device.talkback_play",
+  "device.talkback_stop",
   "event.refresh",
   "light.effects",
   "config.get",
@@ -66,7 +68,13 @@ export function createWsServer(ctx, httpServer) {
       dbg("ws recv", bits.join(" ")); // NB: 2FA code / captcha (msg.code/msg.captcha) never logged
     }
     const reply = (extra) => send(ws, { id, ok: true, ...extra });
-    const fail = (error) => send(ws, { id, ok: false, error: String(error?.message ?? error) });
+    const fail = (error) =>
+      send(ws, {
+        id,
+        ok: false,
+        error: String(error?.message ?? error),
+        ...(Number.isInteger(error?.status) ? { status: error.status } : {}),
+      });
     // Reject a bad request by throwing — the outer catch renders it as { ok:false, error }, the same
     // client-visible result as `return fail(...)`, so the shared guards below don't thread a return.
     const reject = (message) => {
@@ -181,6 +189,21 @@ export function createWsServer(ctx, httpServer) {
           await eufy.reboot(msg.sn);
           return reply({});
         }
+        case "device.talkback_play": {
+          // Play a clip through the camera's speaker (see talkback.mjs): `{ sn, url }` or base64 `audio`,
+          // plus optional `volume` / `maxSeconds` / `wait`. Replies once audio is flowing, or when done.
+          const audio = msg.audio != null ? Buffer.from(String(msg.audio), "base64") : undefined;
+          const result = await ctx.talkbackPlay(msg.sn, {
+            url: msg.url,
+            audio,
+            volume: msg.volume,
+            maxSeconds: msg.maxSeconds ?? msg.max_seconds,
+            wait: msg.wait,
+          });
+          return reply(result);
+        }
+        case "device.talkback_stop":
+          return reply({ stopped: await ctx.talkbackStop(msg.sn) });
         case "event.refresh": {
           // Manual "Last event" image refresh (debug/force button): pull the newest cover NOW and nudge
           // HA. Answers { changed } — true when a genuinely newer image landed.

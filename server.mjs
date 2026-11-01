@@ -4,6 +4,7 @@
 //   HTTP  :PORT/stream/<sn>    live video (Annex-B)           (go2rtc pulls this)
 //   HTTP  :PORT/snapshot/<sn>  a JPEG still
 //   HTTP  :PORT/clip/<sn>      the latest detection's recording, as an mp4 (HomeBase 2)
+//   HTTP  :PORT/api/talkback/<sn>  POST a clip (URL or upload) to play through the camera's speaker
 //   HTTP  :PORT/healthz        liveness + auth state + which cameras are streaming
 //
 // This file is just the WIRING. Each concern lives in src/: config, the SDK client, the shared runtime
@@ -28,6 +29,7 @@ import { createAuth } from "./src/auth.mjs";
 import { createBoot } from "./src/boot.mjs";
 import { createSolix } from "./src/solix.mjs";
 import { createClips } from "./src/clip.mjs";
+import { createTalkback } from "./src/talkback.mjs";
 import { createHttpHandler } from "./src/http-routes.mjs";
 import { createWsServer } from "./src/ws-server.mjs";
 import { closeStreamClients } from "./streams.mjs";
@@ -69,6 +71,7 @@ Object.assign(
   createBoot(ctx),
   createSolix(ctx),
   createClips(ctx),
+  createTalkback(ctx),
 );
 
 const httpServer = http.createServer(createHttpHandler(ctx));
@@ -129,6 +132,7 @@ async function shutdown() {
   if (timers.streamIdle) clearInterval(timers.streamIdle);
   if (timers.rtspIdle) clearInterval(timers.rtspIdle);
   flags.go2rtcProc?.kill();
+  await ctx.stopAllTalkbacks();
   await closeStreamClients();
   await ctx.stopSolix?.();
   await eufy.disconnect?.();
