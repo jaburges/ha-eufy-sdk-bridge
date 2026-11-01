@@ -6,7 +6,9 @@
 #   push to main           → :latest, :sha-<short>
 #   push of a tag vX.Y.Z   → :X.Y.Z, :X.Y, :latest, :sha-<short>   (the tag must match package.json)
 #                            a pre-release tag (vX.Y.Z-rc.1) → :X.Y.Z-rc.1, :sha-<short> only
-#   pull request           → build only, nothing pushed (proves the Dockerfile still builds on both arches)
+#   pull request           → :pr-<number>, :sha-<short> when the PR branch lives in this repository, so
+#                            a branch can be pulled and tested before it is merged; build only from a
+#                            fork (its token cannot write packages)
 #   manual run             → :sha-<short>, plus whatever the selected ref earns above
 # Publishing a GitHub Release creates its tag, which is the tag push above.
 #
@@ -43,14 +45,21 @@ jobs:
         id: meta
         env:
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_FROM_THIS_REPO: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
         run: |
           set -euo pipefail
           IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
           TAGS=("$IMAGE:sha-${HEAD_SHA::7}")
           PUSH=true
-          [ "$GITHUB_EVENT_NAME" = "pull_request" ] && PUSH=false
           VERSION="$(node -p "require('./package.json').version")"
-          if [ "$GITHUB_REF" = "refs/heads/main" ]; then
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            if [ "$PR_FROM_THIS_REPO" = "true" ]; then
+              TAGS+=("$IMAGE:pr-$PR_NUMBER")
+            else
+              PUSH=false
+            fi
+          elif [ "$GITHUB_REF" = "refs/heads/main" ]; then
             TAGS+=("$IMAGE:latest")
           elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             VER="${GITHUB_REF_NAME#v}"
@@ -114,7 +123,7 @@ jobs:
           PUSH: ${{ steps.meta.outputs.push }}
         run: |
           {
-            if [ "$PUSH" = "true" ]; then echo "### Published"; else echo "### Built (not pushed — pull request)"; fi
+            if [ "$PUSH" = "true" ]; then echo "### Published"; else echo "### Built (not pushed — pull request from a fork)"; fi
             echo ""
             echo "Platforms: \`linux/amd64\`, \`linux/arm64\`"
             echo ""
