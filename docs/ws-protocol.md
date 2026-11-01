@@ -286,6 +286,48 @@ _(Requires auth.)_
 { "id": 7, "ok": false, "error": "…" }
 ```
 
+### `device.talkback_play` / `device.talkback_stop`
+
+Play an audio clip through a camera's **speaker** (the SDK's talkback). Only devices whose camera
+reports the speaker param (1241) carry talkback; anything else answers `status: 422`. _(Requires auth.)_
+
+`{ sn, url | audio, volume?, maxSeconds?, wait? }`:
+
+- `url` — an `http://` or `https://` URL the bridge fetches (any format ffmpeg decodes: MP3, WAV, …), **or**
+  `audio` — the file's bytes, base64. Exactly one of the two.
+- `volume` — gain in percent, `0`–`400` (default `100` = unchanged). Applied in the transcode; the
+  device's own speaker volume setting is not touched.
+- `maxSeconds` (or `max_seconds`) — cut the clip at this length. Never more than `TALKBACK_MAX_SECONDS`
+  (default 30); larger values are clamped to it.
+- `wait` — `true` to reply only once the whole clip has reached the device (`finished: true`); by
+  default the reply comes as soon as the speaker is open and audio is flowing (`started: true`).
+
+The clip is transcoded with the bundled ffmpeg to AAC-LC 16 kHz mono ADTS (`-ac 1 -ar 16000 -c:a aac
+-f adts`) **before** the camera is touched, so an undecodable file fails without waking it, and the
+frame count gives the exact `durationMs`. The SDK paces the frames at playback rate (64 ms each).
+Fetched or uploaded files are capped at `TALKBACK_MAX_BYTES` (default 10 MiB) and the fetch at
+`TALKBACK_FETCH_TIMEOUT_MS` (default 15 s). One clip plays per device at a time.
+
+```jsonc
+// →
+{ "id": 12, "cmd": "device.talkback_play", "sn": "EXAMPLE-CAM-0001", "url": "http://ha.local:8123/local/chime.mp3", "volume": 120 }
+// ←
+{ "id": 12, "ok": true, "sn": "EXAMPLE-CAM-0001", "durationMs": 2496, "maxSeconds": 30, "volume": 120, "started": true }
+// with "wait": true ←
+{ "id": 12, "ok": true, "sn": "EXAMPLE-CAM-0001", "durationMs": 2496, "maxSeconds": 30, "volume": 120, "finished": true }
+// a clip already playing on that device →
+{ "id": 13, "ok": false, "error": "a talkback is already playing on EXAMPLE-CAM-0001", "status": 409 }
+
+// stop the clip playing now (stopped=false when nothing was playing) →
+{ "id": 14, "cmd": "device.talkback_stop", "sn": "EXAMPLE-CAM-0001" }
+// ←
+{ "id": 14, "ok": true, "stopped": true }
+```
+
+Talkback errors carry the same `status` the HTTP route would answer with (`400` bad arguments, `404`
+unknown device, `409` already playing, `413` too large, `422` no speaker / undecodable audio, `502` fetch
+or device failure). The HTTP twin is `POST /api/talkback/<sn>` (below).
+
 ### `event.refresh`
 
 Force an immediate **"Last event" image** refresh for a device — pull the newest event cover from the
@@ -458,6 +500,23 @@ Fired when a camera's live P2P feed opens (`active: true`) or is torn down / idl
 | `GET /stream/<sn>`   | live Annex-B H.264/H.265 (`video/H264`) — what go2rtc pulls. _Requires auth._                               |
 | `GET /clip/<sn>`     | the latest detection's HomeBase 2 recording (`video/mp4`). _Requires auth._                                 |
 
+| method + path               | does                                                                                                  |
+| --------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `POST /api/talkback/<sn>`   | play a clip through the camera's speaker (same arguments as `device.talkback_play`). _Requires auth._ |
+| `DELETE /api/talkback/<sn>` | stop the clip playing on that device → `{ ok, stopped }`. _Requires auth._                            |
+
+`POST /api/talkback/<sn>` takes its arguments in any of three shapes:
+
+- `Content-Type: application/json` — `{ "url": "http://…/clip.mp3", "volume": 120, "max_seconds": 10, "wait": false }`.
+- `multipart/form-data` — a file part (named `file` or `audio`) plus the same fields as form values.
+- any other body (e.g. `audio/mpeg`) — the raw file bytes, with `volume` / `max_seconds` / `wait` / `url` as query parameters.
+
+It answers **202** `{ ok, sn, durationMs, maxSeconds, volume, started: true }` once audio is flowing, or
+**200** `{ …, finished: true }` with `wait=true`. Errors are `{ error }` with `400` (bad arguments, a
+non-http(s) URL), `404` (unknown serial), `405` (wrong method), `409` (a clip is already playing on that
+device), `413` (over `TALKBACK_MAX_BYTES`), `422` (no speaker talkback on the device, or audio ffmpeg
+cannot decode), `502` (the fetch or the device failed), or `503` before auth.
+
 The bridge does not infer cloud-poll health from device-event silence; `ok` means the HTTP endpoint answered.
 
 `GET /snapshot/<sn>` uses `SNAPSHOT_LIVE` when no mode is supplied. A request may use `?mode=auto` for
@@ -480,7 +539,8 @@ raw video protocol.
 
 ## Not yet exposed
 
-- Capability **action** verbs beyond the surfaces `device.action` routes today (e.g. talkback).
+- Capability **action** verbs beyond the surfaces `device.action` routes today. (Talkback is exposed as
+  its own `device.talkback_play` / `POST /api/talkback/<sn>`, for finite clips — not live, two-way audio.)
 - PTZ **zoom** (`zoom`) and the preset **read** verbs (`preset.list` / `preset.image`): both exist on
   the SDK surface and `device.action` would route them, but zoom needs a second telephoto lens and the
   read verbs answer over P2P request/reply, so neither is exercised here yet.
