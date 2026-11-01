@@ -14,6 +14,7 @@ WS    :3000/ws             control, state, events     ← the frontend talks to 
 HTTP  :3000/stream/<sn>    live video (Annex-B)       ← go2rtc pulls this
 HTTP  :3000/snapshot/<sn>  a JPEG still
 HTTP  :3000/clip/<sn>      the latest detection's recording, as an mp4 (HomeBase 2)
+HTTP  :3000/api/talkback/<sn>  POST an audio clip to play through the camera's speaker
 HTTP  :3000/healthz        which cameras are streaming
 ```
 
@@ -38,6 +39,90 @@ or with Compose (`cp .env.example .env` first): `docker compose up -d`.
 [docs/docker-compose.md](./docs/docker-compose.md) · **WS protocol:** [docs/ws-protocol.md](./docs/ws-protocol.md) ·
 **Troubleshooting:** [docs/troubleshooting.md](./docs/troubleshooting.md)
 
+## Play a sound through a camera's speaker (talkback)
+
+`POST /api/talkback/<serial>` plays an audio clip (MP3, WAV, anything ffmpeg decodes) through the
+speaker of a camera, doorbell or video lock. The bridge fetches the file, transcodes it with the bundled
+ffmpeg to the AAC-LC 16 kHz mono stream the device expects, and streams it at realtime. Only devices
+whose camera reports a speaker (param 1241) support it; others answer `422`.
+
+```bash
+curl -X POST http://<unraid-ip>:3033/api/talkback/<serial> \
+  -H 'content-type: application/json' \
+  -d '{"url": "http://<ha-ip>:8123/local/halloween/scream.mp3", "volume": 150, "max_seconds": 10}'
+# → 202 {"ok":true,"sn":"<serial>","durationMs":4032,"maxSeconds":10,"volume":150,"started":true}
+
+# or upload the file itself
+curl -X POST http://<unraid-ip>:3033/api/talkback/<serial> -F file=@scream.mp3
+# stop it early
+curl -X DELETE http://<unraid-ip>:3033/api/talkback/<serial>
+```
+
+- `url` must be `http://` or `https://`. Alternatively send the file as the raw body or as a multipart
+  `file` part.
+- `volume` is a gain in percent (`0`–`400`, default `100`) applied while transcoding. The device's own
+  speaker volume setting is not changed.
+- `max_seconds` cuts the clip short. It can never exceed `TALKBACK_MAX_SECONDS` (default 30). Files are
+  capped at `TALKBACK_MAX_BYTES` (default 10 MiB), and a URL must answer within
+  `TALKBACK_FETCH_TIMEOUT_MS` (default 15 s).
+- The bridge answers `202` once the speaker is open and audio is flowing. Add `"wait": true` to get a
+  `200` only after the whole clip has played. Other answers: `404` for an unknown serial, `409` if a clip
+  is already playing on that device, and `413` if the file is too large.
+- The same feature is available over the WebSocket as `device.talkback_play`; see
+  [docs/ws-protocol.md](./docs/ws-protocol.md).
+- Like every other bridge endpoint, this one has no authentication of its own. Keep the bridge port on
+  your LAN.
+
+The port in these examples is `3033` because that is the host port mapped to the container's `3000`;
+use whatever you mapped. The `<serial>` is the device serial number, shown on the device's page in Home
+Assistant or in the `devices.list` WS reply.
+
+### From Home Assistant
+
+Put the clip in Home Assistant's `config/www/` folder, for example `config/www/halloween/scream.mp3`.
+HA then serves it at `http://<ha-ip>:8123/local/halloween/scream.mp3`. Next, add a `rest_command` to
+`configuration.yaml`:
+
+```yaml
+rest_command:
+  eufy_talkback:
+    url: "http://<unraid-ip>:3033/api/talkback/{{ serial }}"
+    method: POST
+    content_type: "application/json"
+    # Opening the speaker can take several seconds on a sleeping battery device.
+    timeout: 30
+    payload: >-
+      {"url": "{{ media_url }}",
+       "volume": {{ volume | default(100) }},
+       "max_seconds": {{ max_seconds | default(30) }}}
+```
+
+Then call it from an automation. This example plays a scream when the floodlight camera sees a person
+after dark. Replace the entity id with your camera's person-detection entity and the serial with your
+device's serial:
+
+```yaml
+automation:
+  - alias: "Halloween scream on person detection"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.floodlight_cam_e340_person_detected
+        to: "on"
+    condition:
+      - condition: sun
+        after: sunset
+    action:
+      - service: rest_command.eufy_talkback
+        data:
+          serial: "T8425XXXXXXXXXXX"
+          media_url: "http://<ha-ip>:8123/local/halloween/scream.mp3"
+          volume: 150
+          max_seconds: 10
+      # Don't retrigger while the clip plays (the bridge would answer 409 anyway).
+      - delay: "00:00:15"
+```
+
 ## Where it fits
 
 | Repo                                                                  | Role                                          |
@@ -51,8 +136,10 @@ or with Compose (`cp .env.example .env` first): `docker compose up -d`.
 > streaming. **Optional Anker Solix** support (power stations / smart meter / Solarbank, a separate account)
 > via `SOLIX_EMAIL` / `SOLIX_PASSWORD` — see [docs/ws-protocol.md](./docs/ws-protocol.md) (`solix.*`).
 > Published image: `ghcr.io/mega-yfue/ha-eufy-sdk-bridge` (multi-arch: `amd64` · `arm64`).
-> **Publishing a GitHub Release** builds and pushes the versioned + `:latest` tags
-> automatically ([`.github/workflows/publish-ghcr.yml`](./.github/workflows/publish-ghcr.yml)); the same
+> [`.github/workflows/publish-ghcr.yml`](./.github/workflows/publish-ghcr.yml) publishes to
+> `ghcr.io/<owner>/<repo>` (so a fork publishes under its own account): a push to `main` pushes `:latest`
+> and `:sha-<short>`, a `vX.Y.Z` tag (or a GitHub Release) adds `:X.Y.Z` / `:X.Y`, and a pull request
+> only builds. The same
 > build runs locally via [`scripts/publish-multiarch.sh`](./scripts/publish-multiarch.sh). A merge to the
 > `dev` branch publishes a rolling `:dev` tag for testing.
 

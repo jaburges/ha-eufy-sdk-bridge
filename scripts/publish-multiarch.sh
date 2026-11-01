@@ -17,11 +17,12 @@
 #   scripts/publish-multiarch.sh              # version from package.json, tags :<version> + :latest
 #   scripts/publish-multiarch.sh 0.1.36       # explicit version
 #   PLATFORMS=linux/amd64,linux/arm64 scripts/publish-multiarch.sh   # override the platform set
+#   IMAGE=ghcr.io/<owner>/ha-eufy-sdk-bridge scripts/publish-multiarch.sh   # publish under a fork
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-IMAGE="ghcr.io/mega-yfue/ha-eufy-sdk-bridge"
+IMAGE="${IMAGE:-ghcr.io/mega-yfue/ha-eufy-sdk-bridge}"
 PLATFORMS="${PLATFORMS:-linux/amd64,linux/arm64}"
 VERSION="${1:-$(node -p "require('./package.json').version")}"
 
