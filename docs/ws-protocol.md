@@ -129,6 +129,11 @@ Every device the account exposes. _(Requires `auth.state == "ok"`.)_
   live-media budget. The `battery` capability alone is not the answer: mains-only models (the T8410 above) still
   carry it.
 - `canReboot` is `true` on HomeBase/station devices, which accept `device.reboot`.
+- `capabilities` includes `doorbell` on every device that can send a `doorbellPress` event (below). That
+  covers what the SDK binds as a doorbell, plus **video locks**: a lock that also has a camera, such as
+  the FamiLock S3 (T85V0), whose keypad has a doorbell button but whose model name the SDK doesn't
+  recognise as a doorbell. It also covers any serial listed in `BRIDGE_DOORBELL_DEVICES`. Only the
+  capability list shows the addition; `decodedState`/`decodedProperties` don't change.
 - A device that failed to resolve appears as `{ "sn": "…", "error": "…" }`.
 
 #### Decoded readings (additive, schema 1)
@@ -460,6 +465,12 @@ If `value` is absent, consumers should re-read state rather than inventing a val
 { "event": "batteryLevel", "deviceSn": "EXAMPLE-CAM…", "to": "74" }
 { "event": "doorbellPress", "deviceSn": "EXAMPLE-DOORBELL…" }
 ```
+
+`doorbellPress` is a ring: eufy push event type 3103 (`PRESS_DOORBELL`). The SDK reports it for any
+device that sends it, including a video lock, which the SDK doesn't bind as a doorbell (see `capabilities`
+above). Its payload is `{ deviceSn, stationSn?, eventType: 3103, thumbnailUrl? }`. If a device rings
+with a different push type, `BRIDGE_RING_EVENT_TYPES` names extra types to report as `doorbellPress`
+too (with that `eventType`). The event log's `push raw:` lines show which type each push carried.
 
 Full set: `propertyChanged`, `motion`, `personDetected`, `strangerDetected`, `doorbellPress`, `petDetection`,
 `packageDelivered`, `packageTaken`, `packageStranded`, `soundDetected`, `cryingDetected`,

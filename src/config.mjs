@@ -11,6 +11,13 @@ const positiveInt = (v) => {
   return v != null && v !== "" && Number.isSafeInteger(n) && n > 0 ? n : undefined;
 };
 
+/** A comma-separated env value as trimmed, non-empty entries. */
+const list = (v) =>
+  String(v ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
 /** The SDK event names broadcast to every connected WS client. */
 export const FORWARDED_EVENTS = [
   "propertyChanged",
@@ -125,6 +132,11 @@ export function loadConfig(env = process.env) {
     talkbackMaxSeconds: positiveInt(env.TALKBACK_MAX_SECONDS) ?? 30,
     talkbackMaxBytes: positiveInt(env.TALKBACK_MAX_BYTES) ?? 10 * 1024 * 1024,
     talkbackFetchTimeoutMs: positiveInt(env.TALKBACK_FETCH_TIMEOUT_MS) ?? 15_000,
+    // Doorbells the SDK cannot tell are doorbells (see doorbell.mjs): serials to report with the
+    // `doorbell` capability regardless, and extra raw push event types to report as a `doorbellPress`
+    // beside the SDK's own PRESS_DOORBELL (3103). Comma-separated; both empty by default.
+    doorbellDevices: new Set(list(env.BRIDGE_DOORBELL_DEVICES)),
+    ringEventTypes: new Set(list(env.BRIDGE_RING_EVENT_TYPES).map(Number).filter(Number.isSafeInteger)),
     // Event pre-warm: the SDK can speculatively open a camera's P2P session on a high-intent event
     // (doorbell/person/pet/package) so a following live view starts instantly. OFF by default here — it
     // holds a battery camera's radio open for ~28s per event. Set BRIDGE_PREWARM=1 to enable the SDK's

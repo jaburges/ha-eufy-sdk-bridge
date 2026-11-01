@@ -123,6 +123,69 @@ automation:
       - delay: "00:00:15"
 ```
 
+## Doorbell rings (including video locks)
+
+A doorbell press reaches the WS as a `doorbellPress` event (eufy push type 3103). The bridge also lists
+`doorbell` in a device's `capabilities`, which is what the Home Assistant integration uses to decide
+whether to build these doorbell entities:
+
+- an **event** entity named `<device> Doorbell` (device class `doorbell`), which fires event type `ring`;
+- a **binary_sensor** named `<device> Ringing`, which turns on with each press and back off after 30 s;
+- a **device trigger** called "Doorbell ringing";
+- a `<device> Package` binary_sensor.
+
+The SDK recognises a doorbell by its model name, which leaves out video smart locks such as the
+FamiLock S3 (T85V0), even though their keypad has a doorbell button. The bridge therefore reports any
+lock that also has a camera as a doorbell. After updating the bridge, **reload the eufy integration in
+Home Assistant** (or restart HA) so it creates the new entities.
+
+For a lock named "Front Door", trigger an automation on its Doorbell event entity:
+
+```yaml
+automation:
+  - alias: "Front door rang"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: event.front_door_doorbell
+    condition:
+      # The event entity's state is the time it last fired; skip the restore at startup.
+      - condition: template
+        value_template: >-
+          {{ trigger.from_state is not none
+             and trigger.from_state.state != 'unavailable'
+             and trigger.to_state.attributes.event_type == 'ring' }}
+    action:
+      - service: notify.mobile_app_phone
+        data:
+          message: "Someone rang the front door"
+```
+
+Alternatively, trigger on `binary_sensor.front_door_ringing` turning `on`, or pick the device in the
+automation editor and choose its "Doorbell ringing" trigger.
+
+The `ring` type appears on the **Doorbell** event entity, not on the "Detection" one
+(`event.front_door_detection`). Detection's event types are fixed in the integration and don't include
+a ring.
+
+**Checking that a press arrives.** The event log is on by default (`BRIDGE_EVENT_LOG=1`). Each press
+should log two lines:
+
+```
+[bridge:event] push raw: event_type=3103 (PRESS_DOORBELL) sn=T85V0K102515088E
+[bridge:event] push in: doorbellPress sn=T85V0K102515088E [detection → HA refreshes Last event] → broadcast to 1 frontend client(s)
+```
+
+- **Only the `push raw:` line appears, with a different `event_type`:** the device rings with another
+  push type. Set `BRIDGE_RING_EVENT_TYPES=<that number>` and restart the bridge, and that type is
+  reported as a `doorbellPress` too.
+- **No `push raw:` line at all:** the push never reached the bridge. Check `pushConnected` in
+  `/healthz`, and make sure doorbell notifications are on for the device in the eufy app.
+- **The device isn't shown as a doorbell:** add its serial to `BRIDGE_DOORBELL_DEVICES`.
+
+`BRIDGE_DEBUG_P2P=1` adds the SDK's own trace for each push (`[push] in: eventType=… events=…`), along
+with a lot of transport noise, so turn it off again afterwards.
+
 ## Where it fits
 
 | Repo                                                                  | Role                                          |
