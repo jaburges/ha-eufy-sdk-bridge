@@ -1,57 +1,83 @@
-# Publish the multi-arch bridge image to GitHub Container Registry on a release.
+# Build the multi-arch bridge image, and publish it to GitHub Container Registry.
 #
-# Trigger: a published GitHub Release (the release tag names the version), or a manual run.
-# Output:  ghcr.io/mega-yfue/ha-eufy-sdk-bridge:<version> + :latest — one manifest carrying
-#          linux/amd64 + linux/arm64 (node:24-alpine has no arm/v7 base).
+# Image:   ghcr.io/<owner>/<repo>, lowercased from `github.repository` — so a fork publishes under its
+#          own account with no edit here.
+# Trigger → tags pushed (one manifest carrying linux/amd64 + linux/arm64; node:24-alpine has no arm/v7):
+#   push to main           → :latest, :sha-<short>
+#   push of a tag vX.Y.Z   → :X.Y.Z, :X.Y, :latest, :sha-<short>   (the tag must match package.json)
+#                            a pre-release tag (vX.Y.Z-rc.1) → :X.Y.Z-rc.1, :sha-<short> only
+#   pull request           → build only, nothing pushed (proves the Dockerfile still builds on both arches)
+#   manual run             → :sha-<short>, plus whatever the selected ref earns above
+# Publishing a GitHub Release creates its tag, which is the tag push above.
 #
-# The SDK is a PUBLIC npm package (pulled by `npm ci` in the build), so no SDK checkout / build context.
-# Uses the docker CLI in shell rather than the docker/* marketplace actions, because the org's Actions
-# policy allows only actions owned by mega-yfue or created by GitHub — so `actions/checkout` is fine,
-# but `docker/build-push-action` etc. are not. buildx is preinstalled on the runner; arm64 emulation
-# comes from a `tonistiigi/binfmt` image pull (an image, not an action). Push uses the built-in
-# GITHUB_TOKEN via `packages: write`.
-name: Publish image to GHCR
+# Uses the docker CLI in shell rather than the docker/* marketplace actions, because the upstream org's
+# Actions policy allows only actions owned by mega-yfue or created by GitHub — so `actions/checkout` is
+# fine, but `docker/build-push-action` etc. are not. buildx is preinstalled on the runner; arm64
+# emulation comes from a `tonistiigi/binfmt` image pull (an image, not an action). Push uses the
+# built-in GITHUB_TOKEN via `packages: write`.
+name: Docker image
 
 on:
-  release:
-    types: [published]
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  pull_request:
+    branches: [main, dev]
   workflow_dispatch:
-    inputs:
-      version:
-        description: "Image version tag (e.g. 0.2.0). Defaults to package.json."
-        required: false
 
 permissions:
   contents: read
   packages: write
 
-env:
-  IMAGE: ghcr.io/mega-yfue/ha-eufy-sdk-bridge
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  publish:
+  image:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Resolve version (release tag must match package.json)
-        id: v
+      - name: Resolve image name and tags
+        id: meta
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
-          if [ -n "${{ github.event.inputs.version }}" ]; then
-            VER="${{ github.event.inputs.version }}"
-          elif [ -n "${{ github.event.release.tag_name }}" ]; then
-            VER="${{ github.event.release.tag_name }}"
-          else
-            VER="$(node -p "require('./package.json').version")"
+          set -euo pipefail
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          TAGS=("$IMAGE:sha-${HEAD_SHA::7}")
+          PUSH=true
+          [ "$GITHUB_EVENT_NAME" = "pull_request" ] && PUSH=false
+          VERSION="$(node -p "require('./package.json').version")"
+          if [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            TAGS+=("$IMAGE:latest")
+          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VER="${GITHUB_REF_NAME#v}"
+            if [[ ! "$VER" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)(-[0-9A-Za-z.-]+)?$ ]]; then
+              echo "::error::tag '$GITHUB_REF_NAME' is not semver (vX.Y.Z)"
+              exit 1
+            fi
+            if [ "$VER" != "$VERSION" ]; then
+              echo "::error::tag version '$VER' does not match package.json '$VERSION' — bump package.json to match before tagging"
+              exit 1
+            fi
+            TAGS+=("$IMAGE:$VER")
+            if [ -z "${BASH_REMATCH[4]}" ]; then
+              TAGS+=("$IMAGE:${BASH_REMATCH[1]}.${BASH_REMATCH[2]}" "$IMAGE:latest")
+            fi
           fi
-          VER="${VER#v}"   # tolerate a leading v (v0.2.0 → 0.2.0)
-          PKG="$(node -p "require('./package.json').version")"
-          if [ "$VER" != "$PKG" ]; then
-            echo "::error::release/input version '$VER' does not match package.json '$PKG' — bump package.json to match before releasing"
-            exit 1
-          fi
-          echo "version=$VER" >> "$GITHUB_OUTPUT"
-          echo "Publishing $IMAGE:$VER (+ :latest)"
+          {
+            echo "image=$IMAGE"
+            echo "push=$PUSH"
+            echo "version=$VERSION"
+            echo "revision=$HEAD_SHA"
+            echo "tags<<EOF"
+            printf '%s\n' "${TAGS[@]}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "Image: $IMAGE (push=$PUSH)"
+          printf '  %s\n' "${TAGS[@]}"
 
       - name: Enable arm64 emulation (binfmt)
         run: docker run --rm --privileged tonistiigi/binfmt --install arm64
@@ -60,21 +86,37 @@ jobs:
         run: docker buildx create --use --name eufy-ci --driver docker-container
 
       - name: Log in to GHCR
+        if: steps.meta.outputs.push == 'true'
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-      - name: Build and push the multi-arch manifest
+      - name: Build (and push unless this is a pull request)
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          PUSH: ${{ steps.meta.outputs.push }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          REVISION: ${{ steps.meta.outputs.revision }}
         run: |
+          set -euo pipefail
+          args=()
+          while IFS= read -r t; do [ -n "$t" ] && args+=(--tag "$t"); done <<< "$TAGS"
+          [ "$PUSH" = "true" ] && args+=(--push)
           docker buildx build \
             --platform linux/amd64,linux/arm64 \
-            --tag "$IMAGE:${{ steps.v.outputs.version }}" \
-            --tag "$IMAGE:latest" \
-            --push \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${REVISION}" \
+            --label "org.opencontainers.image.version=${VERSION}" \
+            "${args[@]}" \
             .
 
       - name: Summary
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          PUSH: ${{ steps.meta.outputs.push }}
         run: |
           {
-            echo "### Published \`$IMAGE:${{ steps.v.outputs.version }}\`"
+            if [ "$PUSH" = "true" ]; then echo "### Published"; else echo "### Built (not pushed — pull request)"; fi
             echo ""
-            echo "Platforms: \`linux/amd64\`, \`linux/arm64\` · also tagged \`:latest\`"
+            echo "Platforms: \`linux/amd64\`, \`linux/arm64\`"
+            echo ""
+            while IFS= read -r t; do [ -n "$t" ] && echo "- \`$t\`"; done <<< "$TAGS"
           } >> "$GITHUB_STEP_SUMMARY"

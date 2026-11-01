@@ -1,14 +1,15 @@
 # Publish the :dev image to GHCR on every merge/push to the `dev` branch.
 #
 # Trigger: a push to `dev` (i.e. a PR merged into dev) — or a manual run. Output:
-#   ghcr.io/mega-yfue/ha-eufy-sdk-bridge:dev  (a rolling tag for the development line).
+#   ghcr.io/<owner>/<repo>:dev  (a rolling tag for the development line; lowercased `github.repository`,
+#   so a fork publishes under its own account).
 #
 # The bridge pulls @mega-yfue/eufy-sdk from the public npm registry (no build context / no SDK
 # checkout). The committed package.json/lock pin the STABLE SDK (same as `main` — no beta drift in the
 # repo); this build passes `SDK_DIST_TAG=beta` so the :dev image overlays the LATEST eufy-sdk beta at
 # build time. Bumping the beta needs no commit here — the next merge to `dev` picks it up automatically.
-# Multi-arch amd64 + arm64 (node:24-alpine has no arm/v7 base). Pushing to ghcr.io/mega-yfue/* uses the
-# built-in GITHUB_TOKEN via packages: write.
+# Multi-arch amd64 + arm64 (node:24-alpine has no arm/v7 base). Pushing to GHCR uses the built-in
+# GITHUB_TOKEN via packages: write.
 name: Publish :dev image to GHCR
 
 on:
@@ -20,14 +21,13 @@ permissions:
   contents: read
   packages: write
 
-env:
-  IMAGE: ghcr.io/mega-yfue/ha-eufy-sdk-bridge
-
 jobs:
   publish-dev:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Resolve the image name
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
       - name: Resolve the current eufy-sdk @beta version
         id: sdk
         # Pin the image to the EXACT beta npm currently serves, not the floating `beta` tag. Passing the
