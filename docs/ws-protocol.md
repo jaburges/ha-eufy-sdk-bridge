@@ -296,7 +296,7 @@ _(Requires auth.)_
 Play an audio clip through a camera's **speaker** (the SDK's talkback). Only devices whose camera
 reports the speaker param (1241) carry talkback; anything else answers `status: 422`. _(Requires auth.)_
 
-`{ sn, url | audio, volume?, maxSeconds?, wait? }`:
+`{ sn, url | audio, volume?, maxSeconds?, wait?, delayMs? }`:
 
 - `url` — an `http://` or `https://` URL the bridge fetches (any format ffmpeg decodes: MP3, WAV, …), **or**
   `audio` — the file's bytes, base64. Exactly one of the two.
@@ -306,6 +306,17 @@ reports the speaker param (1241) carry talkback; anything else answers `status: 
   (default 30); larger values are clamped to it.
 - `wait` — `true` to reply only once the whole clip has reached the device (`finished: true`); by
   default the reply comes as soon as the speaker is open and audio is flowing (`started: true`).
+- `delayMs` (or `delay_ms`) — wait this long before opening anything, `0`–`60000` (default
+  `BRIDGE_TALKBACK_DELAY_MS`, itself `0`). Use it to let a doorbell finish its own chime after a ring.
+
+Before any audio is sent, the bridge opens a live stream and waits for its first video frame
+(`BRIDGE_TALKBACK_LIVESTREAM`, on by default; `BRIDGE_TALKBACK_WARM_TIMEOUT_MS`, default 20 s). It then
+opens the talkback session and waits for the device's answer to the start on the P2P connection: a
+1700 or 1005 frame (`BRIDGE_TALKBACK_CONFIRM_MS`, default 3 s). A "busy" code (`-114` / `-106`), or
+no answer at all, closes the session and retries it (`BRIDGE_TALKBACK_RETRIES`, default 1, after
+`BRIDGE_TALKBACK_RETRY_DELAY_MS`). If no attempt is confirmed, the request fails with `status: 502`.
+Each stage writes a `talkback <sn> → …` event-log line, including the codec the device streams its own
+audio in.
 
 The clip is transcoded with the bundled ffmpeg to AAC-LC 16 kHz mono ADTS (`-ac 1 -ar 16000 -c:a aac
 -f adts`) **before** the camera is touched, so an undecodable file fails without waking it, and the
@@ -317,9 +328,10 @@ Fetched or uploaded files are capped at `TALKBACK_MAX_BYTES` (default 10 MiB) an
 // →
 { "id": 12, "cmd": "device.talkback_play", "sn": "EXAMPLE-CAM-0001", "url": "http://ha.local:8123/local/chime.mp3", "volume": 120 }
 // ←
-{ "id": 12, "ok": true, "sn": "EXAMPLE-CAM-0001", "durationMs": 2496, "maxSeconds": 30, "volume": 120, "started": true }
-// with "wait": true ←
-{ "id": 12, "ok": true, "sn": "EXAMPLE-CAM-0001", "durationMs": 2496, "maxSeconds": 30, "volume": 120, "finished": true }
+{ "id": 12, "ok": true, "sn": "EXAMPLE-CAM-0001", "durationMs": 2496, "maxSeconds": 30, "volume": 120, "delayMs": 0,
+  "attempts": 1, "confirmation": "answered 1700", "deviceAudioCodec": "aac-lc", "started": true }
+// with "wait": true ← (the same fields, plus)
+{ "id": 12, "ok": true, "…": "…", "finished": true, "framesSent": 39 }
 // a clip already playing on that device →
 { "id": 13, "ok": false, "error": "a talkback is already playing on EXAMPLE-CAM-0001", "status": 409 }
 
@@ -331,7 +343,7 @@ Fetched or uploaded files are capped at `TALKBACK_MAX_BYTES` (default 10 MiB) an
 
 Talkback errors carry the same `status` the HTTP route would answer with (`400` bad arguments, `404`
 unknown device, `409` already playing, `413` too large, `422` no speaker / undecodable audio, `502` fetch
-or device failure). The HTTP twin is `POST /api/talkback/<sn>` (below).
+or device failure, a live stream that never delivered a frame, or a session the device never confirmed). The HTTP twin is `POST /api/talkback/<sn>` (below).
 
 ### `event.refresh`
 
@@ -463,7 +475,7 @@ If `value` is absent, consumers should re-read state rather than inventing a val
 { "event": "motion", "deviceSn": "EXAMPLE-CAM…", "stationSn": "EXAMPLE-HB…" }
 { "event": "contactState", "deviceSn": "EXAMPLE-SENSOR…", "open": true }
 { "event": "batteryLevel", "deviceSn": "EXAMPLE-CAM…", "to": "74" }
-{ "event": "doorbellPress", "deviceSn": "EXAMPLE-DOORBELL…" }
+{ "event": "doorbellPress", "deviceSn": "EXAMPLE-DOORBELL…", "ringSource": "push" }
 ```
 
 `doorbellPress` is a ring: eufy push event type 3103 (`PRESS_DOORBELL`). The SDK reports it for any
@@ -471,6 +483,20 @@ device that sends it, including a video lock, which the SDK doesn't bind as a do
 above). Its payload is `{ deviceSn, stationSn?, eventType: 3103, thumbnailUrl? }`. If a device rings
 with a different push type, `BRIDGE_RING_EVENT_TYPES` names extra types to report as `doorbellPress`
 too (with that `eventType`). The event log's `push raw:` lines show which type each push carried.
+
+Every ring goes through one router, so `doorbellPress` fires **once per press**. The router drops a
+device's rings that come within `BRIDGE_RING_DEDUPE_MS` (default 5000) of the last one it sent, so a
+press seen on two paths, or a push eufy delivers twice, is broadcast once. `ringSource` names the path
+the broadcast press came from:
+
+- `push`: the cloud push.
+- `p2p`: a P2P frame matching `BRIDGE_RING_P2P_COMMANDS` (`<commandId>` or `<commandId>:<json cmd>`)
+  from the doorbell's station and channel.
+- `property`: a `propertyChanged` on a doorbell, for a property listed in `BRIDGE_RING_PROPERTIES`, to
+  a truthy value.
+
+The last two are opt-in: neither the SDK nor eufy-security-client knows of a frame or property that
+means "rung". The payload carries `commandId` for a P2P ring and `property` for a property ring.
 
 Full set: `propertyChanged`, `motion`, `personDetected`, `strangerDetected`, `doorbellPress`, `petDetection`,
 `packageDelivered`, `packageTaken`, `packageStranded`, `soundDetected`, `cryingDetected`,
@@ -518,15 +544,16 @@ Fired when a camera's live P2P feed opens (`active: true`) or is torn down / idl
 
 `POST /api/talkback/<sn>` takes its arguments in any of three shapes:
 
-- `Content-Type: application/json` — `{ "url": "http://…/clip.mp3", "volume": 120, "max_seconds": 10, "wait": false }`.
+- `Content-Type: application/json` — `{ "url": "http://…/clip.mp3", "volume": 120, "max_seconds": 10, "wait": false, "delay_ms": 3000 }`.
 - `multipart/form-data` — a file part (named `file` or `audio`) plus the same fields as form values.
-- any other body (e.g. `audio/mpeg`) — the raw file bytes, with `volume` / `max_seconds` / `wait` / `url` as query parameters.
+- any other body (e.g. `audio/mpeg`) — the raw file bytes, with `volume` / `max_seconds` / `wait` / `delay_ms` / `url` as query parameters.
 
-It answers **202** `{ ok, sn, durationMs, maxSeconds, volume, started: true }` once audio is flowing, or
+It answers **202** `{ ok, sn, durationMs, maxSeconds, volume, delayMs, attempts, confirmation, deviceAudioCodec, started: true }` once audio is flowing, or
 **200** `{ …, finished: true }` with `wait=true`. Errors are `{ error }` with `400` (bad arguments, a
 non-http(s) URL), `404` (unknown serial), `405` (wrong method), `409` (a clip is already playing on that
 device), `413` (over `TALKBACK_MAX_BYTES`), `422` (no speaker talkback on the device, or audio ffmpeg
-cannot decode), `502` (the fetch or the device failed), or `503` before auth.
+cannot decode), `502` (the fetch or the device failed, the live stream never delivered a frame, or
+the device never confirmed the talkback session), or `503` before auth.
 
 The bridge does not infer cloud-poll health from device-event silence; `ok` means the HTTP endpoint answered.
 
