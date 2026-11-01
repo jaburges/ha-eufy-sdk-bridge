@@ -4,6 +4,7 @@
 // kicked off after `ready` so they don't hold up serving.
 import { spawn } from "node:child_process";
 import { writeGo2rtcConfig } from "../go2rtc-config.mjs";
+import { ringFromPush } from "./doorbell.mjs";
 
 /**
  * One-shot boot diagnostic: print each camera's station + P2P channel so a same-model collision is
@@ -84,30 +85,39 @@ export function createBoot(ctx) {
         eufy.on("p2pClose", (sn) => dbg(`p2pClose station=${sn}`));
         eufy.on("commandAck", (info) => dbg(`commandAck ${JSON.stringify(info)}`));
       }
-      eufy.on("push", (ev) => ctx.noteRecording?.(ev)); // the recording a detection named, for /clip
-      for (const e of FORWARDED_EVENTS)
-        eufy.on(e, (payload) => {
-          const detection = DETECTION_EVENTS.has(e);
-          if (detection) {
-            ctx.noteDetection(payload?.deviceSn);
-            // Local-storage accounts get no push thumbnail, so pull the fresh event cover from HomeBase
-            // storage and (if it changed) nudge HA to re-fetch — otherwise "Last event" stays frozen.
-            ctx.onDetectionRefresh?.(payload?.deviceSn);
-          }
-          // Narrow event trace (on by default): a push/semantic event arrived — say what it is, which
-          // device, whether it's a detection (which is what makes HA refresh "Last event"), and how many
-          // frontend clients it reaches. 0 clients means HA is not connected, so nothing updates there.
-          if (e !== "propertyChanged") {
-            const clients = ctx.state.clients.size;
-            ctx.eventLog(
-              `push in: ${e} sn=${payload?.deviceSn ?? "?"}` +
-                `${detection ? " [detection → HA refreshes Last event]" : ""}` +
-                ` → broadcast to ${clients} frontend client(s)` +
-                `${clients === 0 ? " (NONE CONNECTED — HA will not update)" : ""}`,
-            );
-          }
-          ctx.broadcast({ event: e, ...ctx.enrichPersonName(e, payload) });
-        });
+      const forward = (e, payload) => {
+        const detection = DETECTION_EVENTS.has(e);
+        if (detection) {
+          ctx.noteDetection(payload?.deviceSn);
+          // Local-storage accounts get no push thumbnail, so pull the fresh event cover from HomeBase
+          // storage and (if it changed) nudge HA to re-fetch — otherwise "Last event" stays frozen.
+          ctx.onDetectionRefresh?.(payload?.deviceSn);
+        }
+        // Narrow event trace (on by default): a push/semantic event arrived — say what it is, which
+        // device, whether it's a detection (which is what makes HA refresh "Last event"), and how many
+        // frontend clients it reaches. 0 clients means HA is not connected, so nothing updates there.
+        if (e !== "propertyChanged") {
+          const clients = ctx.state.clients.size;
+          ctx.eventLog(
+            `push in: ${e} sn=${payload?.deviceSn ?? "?"}` +
+              `${detection ? " [detection → HA refreshes Last event]" : ""}` +
+              ` → broadcast to ${clients} frontend client(s)` +
+              `${clients === 0 ? " (NONE CONNECTED — HA will not update)" : ""}`,
+          );
+        }
+        ctx.broadcast({ event: e, ...ctx.enrichPersonName(e, payload) });
+      };
+      for (const e of FORWARDED_EVENTS) eufy.on(e, (payload) => forward(e, payload));
+      eufy.on("push", (ev) => {
+        ctx.noteRecording?.(ev); // the recording a detection named, for /clip
+        // Every push, decoded or not: when a device's event never shows up as a semantic one (a ring the
+        // SDK has no mapping for), this is the line that names the event type to map.
+        ctx.eventLog(
+          `push raw: event_type=${ev?.eventType ?? "?"} (${ev?.eventName ?? "?"}) sn=${ev?.deviceSn ?? "?"}`,
+        );
+        const ring = ringFromPush(ev, cfg.ringEventTypes);
+        if (ring) forward("doorbellPress", ring);
+      });
       // Use the same capability-based view the WS/HA side uses: a camera is a device describeDevice gave
       // a `stream`, NOT deviceClass==="camera" (the SDK downgrades a camera behind a HomeBase to "other"),
       // so go2rtc registers exactly the cameras HA shows.

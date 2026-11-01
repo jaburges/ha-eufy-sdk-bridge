@@ -1,5 +1,6 @@
 import { unobservableMembers } from "@mega-yfue/eufy-sdk";
 import { onBatteryPower } from "./power.mjs";
+import { hostCapabilities } from "./doorbell.mjs";
 // The host-facing view of a device: identity + capabilities + live property values + a stream path for
 // cameras. This is the shape the WS `devices.list` / `device.state` / `device.properties` commands and
 // the go2rtc camera registration both read, so a camera is "a device describeDevice gave a `stream`",
@@ -7,6 +8,7 @@ import { onBatteryPower } from "./power.mjs";
 
 export function createDeviceView(ctx) {
   const { eufy } = ctx;
+  const doorbellDevices = ctx.cfg?.doorbellDevices;
   // Which members of a bound capability are settable but never reported; injectable so a test can state it.
   const unobservable = ctx.unobservableMembers ?? unobservableMembers;
   const { streaming } = ctx.state;
@@ -28,7 +30,7 @@ export function createDeviceView(ctx) {
       model: m.model || m.modelName, // T-code (e.g. "T8410"); product name as fallback
       modelName: m.modelName, // product display name (e.g. "Indoor Cam Pan & Tilt")
       codec: m.codec,
-      capabilities: m.capabilities,
+      capabilities: hostCapabilities(m, doorbellDevices), // + `doorbell` on a video lock (doorbell.mjs)
       state: propertyState(dev), // live property values ({ battery: 74, motion: false, … })
       ...decodedReadings(dev, m),
       stream: isCamera ? `/stream/${m.sn}` : undefined,
