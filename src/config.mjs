@@ -11,6 +11,12 @@ const positiveInt = (v) => {
   return v != null && v !== "" && Number.isSafeInteger(n) && n > 0 ? n : undefined;
 };
 
+/** A whole number ≥ 0 from an env value, else undefined (so the caller's default applies). */
+const nonNegativeInt = (v) => {
+  const n = Number(v);
+  return v != null && v !== "" && Number.isSafeInteger(n) && n >= 0 ? n : undefined;
+};
+
 /** A comma-separated env value as trimmed, non-empty entries. */
 const list = (v) =>
   String(v ?? "")
@@ -137,6 +143,24 @@ export function loadConfig(env = process.env) {
     // beside the SDK's own PRESS_DOORBELL (3103). Comma-separated; both empty by default.
     doorbellDevices: new Set(list(env.BRIDGE_DOORBELL_DEVICES)),
     ringEventTypes: new Set(list(env.BRIDGE_RING_EVENT_TYPES).map(Number).filter(Number.isSafeInteger)),
+    // A press can arrive on more than one path (push, a P2P frame, a property), and eufy re-sends pushes:
+    // rings of one device within this window are one press. 0 disables the dedupe.
+    ringDedupeMs: nonNegativeInt(env.BRIDGE_RING_DEDUPE_MS) ?? 5_000,
+    // Opt-in ring sources beyond the push, for a device found to report a press another way: P2P frames
+    // (`<commandId>` or `<commandId>:<json cmd>`) and property names whose truthy value means "ringing".
+    ringP2pCommands: new Set(list(env.BRIDGE_RING_P2P_COMMANDS)),
+    ringProperties: new Set(list(env.BRIDGE_RING_PROPERTIES)),
+    // Log every non-media P2P frame (command name/id, JSON cmd, size) — what finding a P2P ring needs.
+    p2pLog: truthy(env.BRIDGE_P2P_LOG),
+    // Talkback session handling (talkback.mjs): wait this long before opening (the device may still be
+    // chiming right after a ring), hold a live stream open and wait for its first frame before talking
+    // (opt-out), and wait for the device to answer the talkback start, retrying when it does not.
+    talkbackDelayMs: nonNegativeInt(env.BRIDGE_TALKBACK_DELAY_MS) ?? 0,
+    talkbackLivestream: env.BRIDGE_TALKBACK_LIVESTREAM == null ? true : truthy(env.BRIDGE_TALKBACK_LIVESTREAM),
+    talkbackWarmTimeoutMs: positiveInt(env.BRIDGE_TALKBACK_WARM_TIMEOUT_MS) ?? 20_000,
+    talkbackConfirmMs: nonNegativeInt(env.BRIDGE_TALKBACK_CONFIRM_MS) ?? 3_000,
+    talkbackRetries: nonNegativeInt(env.BRIDGE_TALKBACK_RETRIES) ?? 1,
+    talkbackRetryDelayMs: nonNegativeInt(env.BRIDGE_TALKBACK_RETRY_DELAY_MS) ?? 1_500,
     // Event pre-warm: the SDK can speculatively open a camera's P2P session on a high-intent event
     // (doorbell/person/pet/package) so a following live view starts instantly. OFF by default here — it
     // holds a battery camera's radio open for ~28s per event. Set BRIDGE_PREWARM=1 to enable the SDK's

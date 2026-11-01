@@ -4,7 +4,7 @@
 // kicked off after `ready` so they don't hold up serving.
 import { spawn } from "node:child_process";
 import { writeGo2rtcConfig } from "../go2rtc-config.mjs";
-import { ringFromPush } from "./doorbell.mjs";
+import { PRESS_DOORBELL, createRings, doorbellSettingsLine, ringFromPush } from "./doorbell.mjs";
 
 /**
  * One-shot boot diagnostic: print each camera's station + P2P channel so a same-model collision is
@@ -56,6 +56,7 @@ async function logCameraChannelMap(eufy, cams) {
 export function createBoot(ctx) {
   const { cfg, eufy, DEBUG, SCHEMA_VERSION, dbg, DETECTION_EVENTS, FORWARDED_EVENTS } = ctx;
   const { flags, timers } = ctx.state;
+  const rings = createRings(ctx);
 
   /** Spawn the bundled go2rtc against the generated config. Non-fatal if the binary isn't present (dev). */
   function startGo2rtc() {
@@ -72,6 +73,26 @@ export function createBoot(ctx) {
       });
     } catch (e) {
       console.error(`[bridge] go2rtc spawn failed: ${e?.message ?? e}`);
+    }
+  }
+
+  /**
+   * Tell the ring router which devices are doorbells and which station + channel their P2P frames carry,
+   * and log each one's ring-related settings — a press the device never pushes is otherwise invisible.
+   */
+  async function registerDoorbells(summaries) {
+    const doorbells = summaries.filter((s) => s.capabilities?.includes("doorbell"));
+    const records = new Map((await (eufy.getDevices?.() ?? [])).map((d) => [d.sn, d]));
+    rings.setDoorbells(
+      doorbells.map(({ sn }) => ({
+        sn,
+        stationSn: records.get(sn)?.stationSn ?? sn,
+        channel: records.get(sn)?.channel,
+      })),
+    );
+    for (const { sn } of doorbells) {
+      const line = doorbellSettingsLine(records.get(sn)?.raw);
+      console.log(`[bridge] doorbell ${sn}: ${line ?? "no ring settings in its cloud record"}`);
     }
   }
 
@@ -107,7 +128,16 @@ export function createBoot(ctx) {
         }
         ctx.broadcast({ event: e, ...ctx.enrichPersonName(e, payload) });
       };
-      for (const e of FORWARDED_EVENTS) eufy.on(e, (payload) => forward(e, payload));
+      ctx.forwardEvent = forward;
+      for (const e of FORWARDED_EVENTS)
+        eufy.on(e, (payload) => {
+          // A press goes through the ring router (doorbell.mjs), which dedupes it against the other paths.
+          if (e === "doorbellPress")
+            return rings.ring(payload?.deviceSn, "push", `event_type=${payload?.eventType ?? PRESS_DOORBELL}`, payload);
+          if (e === "propertyChanged") rings.onPropertyChanged(payload);
+          forward(e, payload);
+        });
+      eufy.on("p2p", (frame) => rings.onP2PFrame(frame));
       eufy.on("push", (ev) => {
         ctx.noteRecording?.(ev); // the recording a detection named, for /clip
         // Every push, decoded or not: when a device's event never shows up as a semantic one (a ring the
@@ -116,7 +146,7 @@ export function createBoot(ctx) {
           `push raw: event_type=${ev?.eventType ?? "?"} (${ev?.eventName ?? "?"}) sn=${ev?.deviceSn ?? "?"}`,
         );
         const ring = ringFromPush(ev, cfg.ringEventTypes);
-        if (ring) forward("doorbellPress", ring);
+        if (ring) rings.ring(ring.deviceSn, "push", `event_type=${ring.eventType}, BRIDGE_RING_EVENT_TYPES`, ring);
       });
       // Use the same capability-based view the WS/HA side uses: a camera is a device describeDevice gave
       // a `stream`, NOT deviceClass==="camera" (the SDK downgrades a camera behind a HomeBase to "other"),
@@ -130,6 +160,7 @@ export function createBoot(ctx) {
       if (cfg.rtspIdleOffMs) timers.rtspIdle ??= setInterval(() => void ctx.rtspIdleSweep(), 60_000);
       console.log(`[bridge] ready — ${summaries.length} devices, ${cams.length} camera stream(s)`);
       await logCameraChannelMap(eufy, cams).catch(() => {});
+      await registerDoorbells(summaries).catch((e) => console.warn(`[bridge] doorbell map: ${e?.message ?? e}`));
       ctx.broadcast({ event: "ready", schemaVersion: SCHEMA_VERSION });
       // Both read the P2P DB via a shared `dbChunk` stream — run sequentially so their accumulators don't
       // cross-contaminate. Non-blocking so `ready` isn't held up.
@@ -142,5 +173,5 @@ export function createBoot(ctx) {
     }
   }
 
-  return { completeBoot, startGo2rtc };
+  return { completeBoot, startGo2rtc, rings };
 }

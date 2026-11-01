@@ -191,7 +191,7 @@ export function createWsServer(ctx, httpServer) {
         }
         case "device.talkback_play": {
           // Play a clip through the camera's speaker (see talkback.mjs): `{ sn, url }` or base64 `audio`,
-          // plus optional `volume` / `maxSeconds` / `wait`. Replies once audio is flowing, or when done.
+          // plus optional `volume` / `maxSeconds` / `wait` / `delayMs`. Replies once audio is flowing, or when done.
           const audio = msg.audio != null ? Buffer.from(String(msg.audio), "base64") : undefined;
           const result = await ctx.talkbackPlay(msg.sn, {
             url: msg.url,
@@ -199,6 +199,7 @@ export function createWsServer(ctx, httpServer) {
             volume: msg.volume,
             maxSeconds: msg.maxSeconds ?? msg.max_seconds,
             wait: msg.wait,
+            delayMs: msg.delayMs ?? msg.delay_ms,
           });
           return reply(result);
         }

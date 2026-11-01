@@ -9,6 +9,8 @@
 import { spawn } from "node:child_process";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import { EventEmitter } from "node:events";
+import { setTimeout as sleep } from "node:timers/promises";
 
 const SAMPLE_RATE = 16_000;
 const FRAME_MS = (1024 / SAMPLE_RATE) * 1000; // one AAC-LC frame = 1024 samples = 64 ms
@@ -17,18 +19,23 @@ const TRANSCODE_TIMEOUT_MS = 30_000;
 // How long past the clip's own duration playback may take before it is abandoned (a slow P2P open is
 // already behind us by then, so this only covers pacing jitter and the stop frame).
 const PLAYBACK_SLACK_MS = 15_000;
-const CHUNK_BYTES = 4096;
+const MAX_DELAY_MS = 60_000;
+// The device's answer to a talkback start: the SDK's 1700 CONTROL_PAYLOAD, or 1005 CMD_START_TALKBACK.
+const TALKBACK_ANSWER_COMMANDS = new Set([1700, 1005]);
+// eufy-security-client's refusals of a talkback start: ERROR_DEV_BUSY ("Wait a second, device is busy")
+// and ERROR_NOT_FIND_DEV ("Someone is responding now").
+const BUSY_CODES = new Set([-114, -106]);
 const MAX_VOLUME_PERCENT = 400;
 
 /** An error carrying the HTTP status the route should answer with. */
 export const talkbackError = (status, message) => Object.assign(new Error(message), { status });
 
 /**
- * Count the ADTS frames in `buf`, checking each is AAC-LC 16 kHz mono — the only audio the device
- * plays. Throws a 422 on anything else, so a bad transcode never reaches the camera.
+ * Split `buf` into its ADTS frames, checking each is AAC-LC 16 kHz mono — the only audio the SDK's
+ * talkback accepts. Throws a 422 on anything else, so a bad transcode never reaches the camera.
  */
-export function adtsFrameCount(buf) {
-  let frames = 0;
+export function adtsFrames(buf) {
+  const frames = [];
   let off = 0;
   while (off < buf.length) {
     if (off + 7 > buf.length) throw talkbackError(422, "audio ends with a truncated ADTS header");
@@ -40,11 +47,14 @@ export function adtsFrameCount(buf) {
       throw talkbackError(422, "audio must be AAC-LC 16 kHz mono");
     const len = ((buf[off + 3] & 0x03) << 11) | (buf[off + 4] << 3) | (buf[off + 5] >> 5);
     if (len < 7 || off + len > buf.length) throw talkbackError(422, "audio has a malformed ADTS frame");
+    frames.push(buf.subarray(off, off + len));
     off += len;
-    frames += 1;
   }
   return frames;
 }
+
+/** How many frames {@link adtsFrames} finds in `buf`. */
+export const adtsFrameCount = (buf) => adtsFrames(buf).length;
 
 /** The ffmpeg arguments that turn any decodable audio on stdin into device-ready ADTS on stdout. */
 export function transcodeArgs({ maxSeconds, volume = 100 }) {
@@ -128,6 +138,20 @@ export async function fetchAudio(rawUrl, { maxBytes, timeoutMs, fetchImpl = fetc
   }
 }
 
+/** Sleep `ms`, returning early when `stop` (an EventEmitter) emits "stop". */
+async function sleepUnlessStopped(ms, stop) {
+  const ac = new AbortController();
+  const onStop = () => ac.abort();
+  stop.once("stop", onStop);
+  try {
+    await sleep(ms, undefined, { signal: ac.signal });
+  } catch {
+    /* stopped early */
+  } finally {
+    stop.off("stop", onStop);
+  }
+}
+
 const truthy = (v) => v === true || /^(1|true|yes|on)$/i.test(String(v ?? ""));
 
 /**
@@ -142,6 +166,7 @@ export async function parseTalkbackRequest(req, url, { maxBytes }) {
     volume: q.get("volume") ?? undefined,
     maxSeconds: q.get("max_seconds") ?? q.get("maxSeconds") ?? undefined,
     wait: q.get("wait") ?? undefined,
+    delayMs: q.get("delay_ms") ?? q.get("delayMs") ?? undefined,
   };
   const contentType = String(req.headers["content-type"] ?? "");
   const type = contentType.split(";")[0].trim().toLowerCase();
@@ -152,6 +177,7 @@ export async function parseTalkbackRequest(req, url, { maxBytes }) {
       ["volume", ["volume"]],
       ["maxSeconds", ["max_seconds", "maxSeconds"]],
       ["wait", ["wait"]],
+      ["delayMs", ["delay_ms", "delayMs"]],
     ])
       for (const name of names) {
         const v = get(name);
@@ -196,7 +222,7 @@ export function createTalkback(ctx) {
   const active = new Map(); // sn -> { handle?, stopped, durationMs }
 
   /** Validate and default the caller's options; throws a 400 on anything malformed. */
-  function normalize({ url, audio, volume, maxSeconds, wait }) {
+  function normalize({ url, audio, volume, maxSeconds, wait, delayMs }) {
     const hasUrl = url != null && url !== "";
     if (hasUrl && audio?.length) throw talkbackError(400, "send either a url or audio, not both");
     if (!hasUrl && !audio?.length) throw talkbackError(400, "talkback needs a url or an audio body");
@@ -214,24 +240,40 @@ export function createTalkback(ctx) {
       if (!Number.isFinite(vol) || vol < 0 || vol > MAX_VOLUME_PERCENT)
         throw talkbackError(400, `volume must be a percentage from 0 to ${MAX_VOLUME_PERCENT}`);
     }
-    return { url: hasUrl ? url : undefined, audio, volume: vol, maxSeconds: seconds, wait: truthy(wait) };
+    let delay = cfg.talkbackDelayMs;
+    if (delayMs != null && delayMs !== "") {
+      delay = Number(delayMs);
+      if (!Number.isSafeInteger(delay) || delay < 0 || delay > MAX_DELAY_MS)
+        throw talkbackError(400, `delay_ms must be a whole number of ms from 0 to ${MAX_DELAY_MS}`);
+    }
+    return {
+      url: hasUrl ? url : undefined,
+      audio,
+      volume: vol,
+      maxSeconds: seconds,
+      wait: truthy(wait),
+      delayMs: delay,
+    };
   }
 
-  /** Pace `adts` into an open handle; resolves once the clip has reached the wire (or was stopped). */
-  function runPlayback(sn, slot, handle, adts) {
+  /** Pace `frames` into an open handle; resolves once the clip has reached the wire (or was stopped). */
+  function runPlayback(sn, slot, handle, frames) {
     return new Promise((resolve, reject) => {
       let settled = false;
+      let yielded = 0;
       const finish = (err) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        const sent = Math.max(0, yielded - (handle.pending ?? 0));
+        log(`talkback ${sn} → frames sent: ${sent}/${frames.length}`);
         Promise.resolve()
           .then(() => handle.stop())
           .catch((e) => console.error(`[bridge] talkback ${sn}: stop failed: ${e?.message ?? e}`))
           .finally(() => {
-            if (slot.stopped) return resolve({ finished: false, stopped: true });
+            if (slot.stopped) return resolve({ finished: false, stopped: true, framesSent: sent });
             if (err) return reject(err);
-            resolve({ finished: true });
+            resolve({ finished: true, framesSent: sent });
           });
       };
       const timer = setTimeout(
@@ -244,10 +286,146 @@ export function createTalkback(ctx) {
       // A battery camera's media session stops at its power budget; the clip is already capped, so let
       // it run to the end rather than cutting it off mid-sentence.
       handle.on("budget", (notice) => notice?.extend?.());
-      const chunks = [];
-      for (let i = 0; i < adts.length; i += CHUNK_BYTES) chunks.push(adts.subarray(i, i + CHUNK_BYTES));
-      pipeline(Readable.from(chunks), handle.writable()).catch((e) => finish(e));
+      const source = function* () {
+        for (const frame of frames) {
+          yielded += 1;
+          yield frame;
+        }
+      };
+      pipeline(Readable.from(source()), handle.writable()).catch((e) => finish(e));
     });
+  }
+
+  /**
+   * Hold a live stream open on `cam` and wait for its first video frame. eufy-security-client refuses to
+   * start talkback without a running livestream, and the SDK's own talkback attaches to the shared live
+   * source without waiting for it to deliver — so on a device still waking, the clip can be paced into a
+   * session that is not serving yet. Joining that same source first and seeing a frame closes that gap.
+   * Also records the codec the device streams its own audio in, for the codec log line.
+   */
+  async function warmLive(sn, cam, stop) {
+    const t0 = Date.now();
+    log(`talkback ${sn} → live stream requested (waiting up to ${cfg.talkbackWarmTimeoutMs} ms for a frame)`);
+    let consumer;
+    try {
+      consumer = await cam.live();
+    } catch (e) {
+      throw talkbackError(502, `opening the live stream failed: ${e?.message ?? e}`);
+    }
+    const live = {
+      audioCodec: undefined,
+      release: () => {
+        try {
+          consumer.stop();
+        } catch {
+          /* already stopped */
+        }
+      },
+    };
+    consumer.on("audio", (frame) => {
+      if (live.audioCodec || !frame?.codec) return;
+      live.audioCodec = frame.codec;
+      log(`talkback ${sn} → device's own live audio codec: ${frame.codec}`);
+    });
+    consumer.on("budget", (notice) => notice?.extend?.());
+    let video;
+    try {
+      video = await new Promise((resolve, reject) => {
+        const timer = setTimeout(
+          () => reject(new Error(`no video frame within ${cfg.talkbackWarmTimeoutMs} ms`)),
+          cfg.talkbackWarmTimeoutMs,
+        );
+        const done = (fn) => (v) => {
+          clearTimeout(timer);
+          stop.off("stop", onStop);
+          fn(v);
+        };
+        const onStop = done(() => reject(new Error("stopped by request")));
+        stop.once("stop", onStop);
+        consumer.once("video", done(resolve));
+        consumer.once("error", done(reject));
+        consumer.once(
+          "stop",
+          done(() => reject(new Error("the live stream stopped before its first frame"))),
+        );
+      });
+    } catch (e) {
+      live.release();
+      throw talkbackError(502, `live stream not confirmed: ${e?.message ?? e}`);
+    }
+    consumer.on("error", (e) => log(`talkback ${sn} → live stream error: ${e?.message ?? e}`));
+    const geometry = video?.width ? ` ${video.width}x${video.height}` : "";
+    log(`talkback ${sn} → live stream confirmed in ${Date.now() - t0} ms (video ${video?.codec ?? "?"}${geometry})`);
+    return live;
+  }
+
+  /**
+   * Watch `stationSn`'s P2P frames for the device's answer to a talkback start: the 1700 control
+   * payload the SDK sends, or eufy-security-client's 1005 CMD_START_TALKBACK. Resolves
+   * `{ confirmed, reason }` — a busy/someone-responding code or no answer within the window is not a
+   * confirmation. Without an observable P2P stream the start is taken on trust, as the SDK does.
+   */
+  function watchAnswer(sn, stationSn) {
+    if (!cfg.talkbackConfirmMs) return { result: Promise.resolve({ confirmed: true, reason: "not awaited" }) };
+    if (typeof eufy.on !== "function" || typeof eufy.off !== "function")
+      return { result: Promise.resolve({ confirmed: true, reason: "answer not observable" }) };
+    let onFrame;
+    let timer;
+    const result = new Promise((resolve) => {
+      onFrame = (f) => {
+        if (f?.stationSn !== stationSn || !TALKBACK_ANSWER_COMMANDS.has(f.commandId)) return;
+        const data = f.data ?? Buffer.alloc(0);
+        const code = data.length >= 4 ? data.readInt32LE(0) : undefined;
+        log(
+          `talkback ${sn} → device answered ${f.commandName ?? "?"}(${f.commandId}) ${data.length}B` +
+            ` code=${code ?? "?"} head=${data.subarray(0, 16).toString("hex")}`,
+        );
+        if (BUSY_CODES.has(code)) resolve({ confirmed: false, reason: `device busy (code ${code})` });
+        else resolve({ confirmed: true, reason: `answered ${f.commandId}` });
+      };
+      eufy.on("p2p", onFrame);
+      timer = setTimeout(
+        () => resolve({ confirmed: false, reason: `no answer within ${cfg.talkbackConfirmMs} ms` }),
+        cfg.talkbackConfirmMs,
+      );
+    }).finally(() => {
+      clearTimeout(timer);
+      eufy.off("p2p", onFrame);
+    });
+    return { result };
+  }
+
+  /** Open the talkback path, retrying while the device does not confirm it. Returns the open handle. */
+  async function openConfirmed(sn, cam, stationSn, slot) {
+    const attempts = 1 + cfg.talkbackRetries;
+    let reason = "";
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      if (slot.stopped) return undefined;
+      log(`talkback ${sn} → session requested (attempt ${attempt}/${attempts})`);
+      const answer = watchAnswer(sn, stationSn);
+      let handle;
+      try {
+        handle = await cam.talkback();
+      } catch (e) {
+        answer.result.catch(() => {});
+        const msg = String(e?.message ?? e);
+        throw talkbackError(/already talking/i.test(msg) ? 409 : 502, `opening talkback failed: ${msg}`);
+      }
+      slot.handle = handle;
+      const outcome = await answer.result;
+      if (outcome.confirmed) {
+        log(`talkback ${sn} → session confirmed (${outcome.reason})`);
+        slot.attempts = attempt;
+        slot.confirmation = outcome.reason;
+        return handle;
+      }
+      reason = outcome.reason;
+      log(`talkback ${sn} → session not confirmed: ${reason}`);
+      slot.handle = undefined;
+      await handle.stop().catch(() => {});
+      if (attempt < attempts) await sleep(cfg.talkbackRetryDelayMs);
+    }
+    throw talkbackError(502, `talkback session not confirmed by ${sn} after ${attempts} attempt(s): ${reason}`);
   }
 
   /**
@@ -259,13 +437,20 @@ export function createTalkback(ctx) {
     if (!sn) throw talkbackError(400, "talkback needs a device serial");
     const opts = normalize(options);
     if (active.has(sn)) throw talkbackError(409, `a talkback is already playing on ${sn}`);
-    const slot = { stopped: false, durationMs: 0 };
+    const slot = { stopped: false, durationMs: 0, stop: new EventEmitter() };
     active.set(sn, slot);
-    const release = () => active.get(sn) === slot && active.delete(sn);
+    const release = () => {
+      slot.live?.release();
+      slot.live = undefined;
+      if (active.get(sn) === slot) active.delete(sn);
+    };
+    const stopped = () => ({ started: false, stopped: true, durationMs: slot.durationMs });
     try {
+      let dev;
       let cam;
       try {
-        cam = (await eufy.getDevice(sn)).camera?.();
+        dev = await eufy.getDevice(sn);
+        cam = dev.camera?.();
       } catch (e) {
         throw talkbackError(404, `unknown device ${sn}: ${e?.message ?? e}`);
       }
@@ -275,34 +460,54 @@ export function createTalkback(ctx) {
         opts.audio ??
         (await fetchClip(opts.url, { maxBytes: cfg.talkbackMaxBytes, timeoutMs: cfg.talkbackFetchTimeoutMs }));
       const adts = await transcode(input, { maxSeconds: opts.maxSeconds, volume: opts.volume });
-      const frames = adtsFrameCount(adts);
-      if (!frames) throw talkbackError(422, "the audio decoded to nothing");
-      slot.durationMs = Math.round(frames * FRAME_MS);
-      if (slot.stopped) return { started: false, stopped: true, durationMs: slot.durationMs };
-      let handle;
-      try {
-        handle = await cam.talkback();
-      } catch (e) {
-        const msg = String(e?.message ?? e);
-        throw talkbackError(/already talking/i.test(msg) ? 409 : 502, `opening talkback failed: ${msg}`);
+      const frames = adtsFrames(adts);
+      if (!frames.length) throw talkbackError(422, "the audio decoded to nothing");
+      slot.durationMs = Math.round(frames.length * FRAME_MS);
+      if (opts.delayMs) {
+        log(`talkback ${sn} → waiting ${opts.delayMs} ms before opening the session`);
+        await sleepUnlessStopped(opts.delayMs, slot.stop);
       }
-      slot.handle = handle;
       if (slot.stopped) {
-        await handle.stop().catch(() => {});
-        return { started: false, stopped: true, durationMs: slot.durationMs };
+        release();
+        return stopped();
       }
-      log(`talkback ${sn} → playing ${slot.durationMs} ms (${frames} frames, volume ${opts.volume}%)`);
-      const done = runPlayback(sn, slot, handle, adts)
+      if (!cfg.talkbackLivestream) log(`talkback ${sn} → live stream skipped (BRIDGE_TALKBACK_LIVESTREAM=0)`);
+      else if (typeof cam.live !== "function") log(`talkback ${sn} → live stream unavailable on this device`);
+      else slot.live = await warmLive(sn, cam, slot.stop);
+      const handle = await openConfirmed(sn, cam, dev.stationSn ?? sn, slot);
+      if (!handle || slot.stopped) {
+        await handle?.stop().catch(() => {});
+        release();
+        return stopped();
+      }
+      const deviceCodec = slot.live?.audioCodec ?? (slot.live ? "not seen yet" : "unknown (no live stream)");
+      log(
+        `talkback ${sn} → codec: sending AAC-LC ${SAMPLE_RATE} Hz mono ADTS, ${frames.length} frames ` +
+          `(${slot.durationMs} ms), volume ${opts.volume}%; device's own live audio: ${deviceCodec}` +
+          `${slot.live?.audioCodec && slot.live.audioCodec !== "aac-lc" ? " (differs from what talkback sends)" : ""}`,
+      );
+      log(`talkback ${sn} → playing ${slot.durationMs} ms (${frames.length} frames, volume ${opts.volume}%)`);
+      const done = runPlayback(sn, slot, handle, frames)
         .then((r) => {
-          log(`talkback ${sn} → ${r.stopped ? "stopped" : "finished"}`);
+          log(`talkback ${sn} → stopped (${r.stopped ? "stopped by request" : "finished"})`);
           return r;
         })
         .catch((e) => {
           console.error(`[bridge] talkback ${sn} failed: ${e?.message ?? e}`);
+          log(`talkback ${sn} → stopped (error: ${e?.message ?? e})`);
           throw e;
         })
         .finally(release);
-      const base = { sn, durationMs: slot.durationMs, maxSeconds: opts.maxSeconds, volume: opts.volume };
+      const base = {
+        sn,
+        durationMs: slot.durationMs,
+        maxSeconds: opts.maxSeconds,
+        volume: opts.volume,
+        delayMs: opts.delayMs,
+        attempts: slot.attempts,
+        confirmation: slot.confirmation,
+        deviceAudioCodec: slot.live?.audioCodec ?? null,
+      };
       if (!opts.wait) {
         done.catch(() => {}); // already logged; nobody is waiting on it
         return { ...base, started: true };
@@ -314,6 +519,7 @@ export function createTalkback(ctx) {
       }
     } catch (e) {
       if (!slot.handle) release();
+      if (slot.stopped && e?.status === 502) return stopped(); // a stop interrupted the warm-up or the open
       throw e;
     }
   }
@@ -323,6 +529,7 @@ export function createTalkback(ctx) {
     const slot = active.get(sn);
     if (!slot) return false;
     slot.stopped = true;
+    slot.stop.emit("stop");
     await slot.handle?.stop().catch(() => {});
     return true;
   }
