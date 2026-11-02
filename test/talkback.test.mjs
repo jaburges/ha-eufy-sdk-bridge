@@ -184,7 +184,18 @@ test("POST JSON url: fetches the clip, streams it to the speaker, answers 202 wi
   });
   assert.equal(r.status, 202);
   const body = await r.json();
-  assert.deepEqual(body, { ok: true, sn: "CAM1", durationMs: 640, maxSeconds: 10, volume: 150, started: true });
+  assert.deepEqual(body, {
+    ok: true,
+    sn: "CAM1",
+    durationMs: 640,
+    maxSeconds: 10,
+    volume: 150,
+    delayMs: 0,
+    attempts: 1,
+    confirmation: "answer not observable",
+    deviceAudioCodec: null,
+    started: true,
+  });
   assert.equal(transcodes[0].input.toString(), "MP3DATA");
   assert.deepEqual(transcodes[0].opts, { maxSeconds: 10, volume: 150 });
   await until(() => handles[0]?.stops > 0);
@@ -339,6 +350,10 @@ test("WS device.talkback_play / device.talkback_stop", async (t) => {
     durationMs: 640,
     maxSeconds: 4,
     volume: 100,
+    delayMs: 0,
+    attempts: 1,
+    confirmation: "answer not observable",
+    deviceAudioCodec: null,
     started: true,
   });
   assert.equal(transcodes[0].input.toString(), "WSMP3");

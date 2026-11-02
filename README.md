@@ -65,13 +65,56 @@ curl -X DELETE http://<unraid-ip>:3033/api/talkback/<serial>
 - `max_seconds` cuts the clip short. It can never exceed `TALKBACK_MAX_SECONDS` (default 30). Files are
   capped at `TALKBACK_MAX_BYTES` (default 10 MiB), and a URL must answer within
   `TALKBACK_FETCH_TIMEOUT_MS` (default 15 s).
+- `delay_ms` waits that long before the bridge opens anything (`0`–`60000`; default
+  `BRIDGE_TALKBACK_DELAY_MS`, itself `0`). Right after a ring the device may still be playing its own
+  chime, so a doorbell automation should leave it a few seconds, for example `"delay_ms": 3000`.
 - The bridge answers `202` once the speaker is open and audio is flowing. Add `"wait": true` to get a
   `200` only after the whole clip has played. Other answers: `404` for an unknown serial, `409` if a clip
-  is already playing on that device, and `413` if the file is too large.
+  is already playing on that device, `413` if the file is too large, and `502` if the device never
+  confirmed the session (see below).
+- The response also reports `attempts`, `confirmation` (how the session was confirmed),
+  `deviceAudioCodec` (the codec the device streams its own audio in), and `delayMs`.
 - The same feature is available over the WebSocket as `device.talkback_play`; see
   [docs/ws-protocol.md](./docs/ws-protocol.md).
 - Like every other bridge endpoint, this one has no authentication of its own. Keep the bridge port on
   your LAN.
+
+#### How a talkback session is opened
+
+Before it sends any audio, the bridge goes through these steps, logging a `talkback <serial> → …` line
+for each one:
+
+1. **Optional delay.** It waits `delay_ms`, if one was given.
+2. **Live stream.** It opens a live stream on the device and waits for its first video frame, for up to
+   `BRIDGE_TALKBACK_WARM_TIMEOUT_MS` (default 20 s). The device plays host audio only while its media
+   session is serving. eufy-security-client won't start talkback without a running live stream. The
+   SDK, on its own, starts sending audio before the stream has delivered anything. The bridge closes
+   the stream when the clip ends. Set `BRIDGE_TALKBACK_LIVESTREAM=0` to skip this step.
+3. **Talkback session.** It opens the session and waits up to `BRIDGE_TALKBACK_CONFIRM_MS` (default
+   3 s; `0` to not wait) for the device's answer on the P2P connection. A "busy" answer (code `-114`
+   or `-106`), or no answer at all, closes the session and tries again, `BRIDGE_TALKBACK_RETRIES` more
+   times (default 1) after `BRIDGE_TALKBACK_RETRY_DELAY_MS` (default 1.5 s). If every attempt fails,
+   the request answers `502`.
+4. **Audio.** It sends the frames at realtime pace, logs how many were sent, and closes the session.
+
+A successful talkback logs:
+
+```
+talkback T85V0… → waiting 3000 ms before opening the session
+talkback T85V0… → live stream requested (waiting up to 20000 ms for a frame)
+talkback T85V0… → device's own live audio codec: aac-lc
+talkback T85V0… → live stream confirmed in 2140 ms (video h265 1920x1080)
+talkback T85V0… → session requested (attempt 1/2)
+talkback T85V0… → device answered CMD_CONTROL_PAYLOAD(1700) 132B code=0 head=…
+talkback T85V0… → session confirmed (answered 1700)
+talkback T85V0… → codec: sending AAC-LC 16000 Hz mono ADTS, 97 frames (6208 ms), volume 150%; device's own live audio: aac-lc
+talkback T85V0… → frames sent: 97/97
+talkback T85V0… → stopped (finished)
+```
+
+The SDK only sends AAC-LC 16 kHz mono. If the codec line says the device's own audio is `aac-eld` or
+`g711a`, the device may expect that codec back, and the line is flagged "differs from what talkback
+sends".
 
 The port in these examples is `3033` because that is the host port mapped to the container's `3000`;
 use whatever you mapped. The `<serial>` is the device serial number, shown on the device's page in Home
@@ -89,12 +132,14 @@ rest_command:
     url: "http://<unraid-ip>:3033/api/talkback/{{ serial }}"
     method: POST
     content_type: "application/json"
-    # Opening the speaker can take several seconds on a sleeping battery device.
-    timeout: 30
+    # The bridge answers once audio is flowing: the delay, the live-stream warm-up (seconds on a
+    # sleeping battery device) and the session check all come first.
+    timeout: 45
     payload: >-
       {"url": "{{ media_url }}",
        "volume": {{ volume | default(100) }},
-       "max_seconds": {{ max_seconds | default(30) }}}
+       "max_seconds": {{ max_seconds | default(30) }},
+       "delay_ms": {{ delay_ms | default(0) }}}
 ```
 
 Then call it from an automation. This example plays a scream when the floodlight camera sees a person
@@ -168,19 +213,60 @@ The `ring` type appears on the **Doorbell** event entity, not on the "Detection"
 (`event.front_door_detection`). Detection's event types are fixed in the integration and don't include
 a ring.
 
+**Where a ring can come from.** Every path a press can arrive on goes through one ring router, which
+logs the path and broadcasts **one** `doorbellPress` per press. The event carries `ringSource`:
+`push`, `p2p`, or `property`.
+
+- **`push`:** eufy's cloud push 3103, plus any push types listed in `BRIDGE_RING_EVENT_TYPES`. This is
+  the only ring path that eufy-security-client and the SDK know of.
+- **`p2p` (opt-in):** P2P frames from the doorbell that match `BRIDGE_RING_P2P_COMMANDS`, each entry
+  either `<commandId>` or `<commandId>:<json cmd>`. Neither library knows of a P2P frame that means
+  "rung", so this is for a frame that a capture (`BRIDGE_P2P_LOG=1`) shows arriving on a press. Frames
+  only arrive while the bridge has a P2P connection open to the device.
+- **`property` (opt-in):** a `propertyChanged` on a doorbell, for a property listed in
+  `BRIDGE_RING_PROPERTIES`, to a truthy value. The SDK has no doorbell "ringing" property.
+  eufy-security-client's `ringing` is synthesised from the push, and the SDK's `devRingStatus` is a
+  siren's state.
+
+A device's rings within `BRIDGE_RING_DEDUPE_MS` (default 5000; `0` disables) of the last one sent are
+treated as the same press, so a press seen on two paths, or a push eufy delivers twice, fires once.
+
+**Why a press may produce no push at all.** If the doorbell doesn't play its chime, it didn't register
+the press as a ring, and no part of the bridge can see it. When it does chime but no push arrives, eufy
+didn't send one. eufy-security-client lists these T85V0 settings that decide that. The bridge logs
+whichever of them the device's cloud record carries at startup
+(`[bridge] doorbell <serial>: notification(1710)=…, snooze(1271)=…, retrigger interval(1250)=…`):
+
+- **Notification settings (1710):** whether ring notifications are enabled.
+- **Snooze (1271):** while it's active, notifications are muted.
+- **Recording retrigger interval (1250, 2–60 s):** events closer together than this are folded into
+  one, so several quick presses can produce a single push.
+
+Check them in the eufy app: the device's Notifications, Snooze and Recording/Event settings. If none
+of them explains it, eufy may also simply be rate-limiting doorbell notifications.
+
 **Checking that a press arrives.** The event log is on by default (`BRIDGE_EVENT_LOG=1`). Each press
-should log two lines:
+should log:
 
 ```
 [bridge:event] push raw: event_type=3103 (PRESS_DOORBELL) sn=T85V0K102515088E
+[bridge:event] ring T85V0K102515088E via push (event_type=3103) → doorbellPress
 [bridge:event] push in: doorbellPress sn=T85V0K102515088E [detection → HA refreshes Last event] → broadcast to 1 frontend client(s)
 ```
 
+A second sighting of the same press logs
+`ring … via <source> (…) → duplicate of the push ring 800 ms ago, suppressed`. Property changes on a
+doorbell are logged as `property in: <name>=<value> sn=…`.
+
 - **Only the `push raw:` line appears, with a different `event_type`:** the device rings with another
   push type. Set `BRIDGE_RING_EVENT_TYPES=<that number>` and restart the bridge, and that type is
-  reported as a `doorbellPress` too.
+  reported as a `doorbellPress` too. Push 257 is not one of these: it is `LockPushEvent.MANUAL_UNLOCK`,
+  meaning someone turned the lock by hand, and it arrives as `lockState` with `locked: false`.
 - **No `push raw:` line at all:** the push never reached the bridge. Check `pushConnected` in
-  `/healthz`, and make sure doorbell notifications are on for the device in the eufy app.
+  `/healthz`, and the settings above.
+- **To look for a P2P ring:** set `BRIDGE_P2P_LOG=1`. Every non-media P2P frame is then logged as
+  `p2p in: <command>(<id>) cmd=… ch=… station=… <n>B`. If one shows up on each press, list it in
+  `BRIDGE_RING_P2P_COMMANDS`.
 - **The device isn't shown as a doorbell:** add its serial to `BRIDGE_DOORBELL_DEVICES`.
 
 `BRIDGE_DEBUG_P2P=1` adds the SDK's own trace for each push (`[push] in: eventType=… events=…`), along
@@ -202,7 +288,8 @@ with a lot of transport noise, so turn it off again afterwards.
 > [`.github/workflows/publish-ghcr.yml`](./.github/workflows/publish-ghcr.yml) publishes to
 > `ghcr.io/<owner>/<repo>` (so a fork publishes under its own account): a push to `main` pushes `:latest`
 > and `:sha-<short>`, a `vX.Y.Z` tag (or a GitHub Release) adds `:X.Y.Z` / `:X.Y`, and a pull request
-> only builds. The same
+> from a branch of this repository pushes `:pr-<number>` (and `:sha-<short>`), so it can be tested before
+> merging. A pull request from a fork only builds. The same
 > build runs locally via [`scripts/publish-multiarch.sh`](./scripts/publish-multiarch.sh). A merge to the
 > `dev` branch publishes a rolling `:dev` tag for testing.
 

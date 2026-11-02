@@ -123,7 +123,9 @@ test("boot: a doorbellPress from the lock is broadcast and logged as a detection
   eufy.emit("push", { eventType: PRESS_DOORBELL, eventName: "PRESS_DOORBELL", deviceSn: LOCK_SN });
   eufy.emit("doorbellPress", { deviceSn: LOCK_SN, eventType: PRESS_DOORBELL });
   const presses = sent.filter((m) => m.event === "doorbellPress");
-  assert.deepEqual(presses, [{ event: "doorbellPress", deviceSn: LOCK_SN, eventType: PRESS_DOORBELL }]);
+  assert.deepEqual(presses, [
+    { event: "doorbellPress", deviceSn: LOCK_SN, eventType: PRESS_DOORBELL, ringSource: "push" },
+  ]);
   assert.deepEqual(detections, [LOCK_SN]);
   assert.ok(logs.includes(`push raw: event_type=3103 (PRESS_DOORBELL) sn=${LOCK_SN}`));
   assert.ok(logs.some((l) => l.startsWith(`push in: doorbellPress sn=${LOCK_SN} [detection`)));
